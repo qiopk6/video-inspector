@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import queue
+import shutil
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from app.core.analyzer import AnalysisCancelled, VideoAnalyzer
+from app.core.models import AnalysisResult
+
+
+FINAL_STATES = {"completed", "failed", "cancelled"}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+@dataclass(slots=True)
+class WebJob:
+    id: str
+    filename: str
+    source_path: Path
+    size_bytes: int
+    status: str = "queued"
+    progress: int = 0
+    created_at: str = field(default_factory=_now)
+    started_at: str | None = None
+    completed_at: str | None = None
+    error: str | None = None
+    result: AnalysisResult | None = None
+    cleanup_source: bool = field(default=True, repr=False)
+    cleanup_root: Path | None = field(default=None, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def to_public(self, include_log: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": self.id,
+            "filename": self.filename,
+            "size_bytes": self.size_bytes,
+            "status": self.status,
+            "progress": self.progress,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "error": self.error,
+            "result": self.result.to_dict() if self.result else None,
+        }
+        if include_log:
+            payload["raw_log"] = self.result.raw_log if self.result else ""
+        return payload
+
+
+class JobManager:
+    def __init__(self, analyzer: VideoAnalyzer, upload_root: Path) -> None:
+        self.analyzer = analyzer
+        self.upload_root = upload_root
+        self.upload_root.mkdir(parents=True, exist_ok=True)
+        self._jobs: dict[str, WebJob] = {}
+        self._lock = threading.RLock()
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._worker = threading.Thread(target=self._run, name="video-analysis-worker", daemon=True)
+        self._closed = False
+        self._worker.start()
+
+    def add(
+        self,
+        filename: str,
+        source_path: Path,
+        size_bytes: int,
+        cleanup_source: bool = True,
+        cleanup_root: Path | None = None,
+    ) -> WebJob:
+        job = WebJob(
+            id=uuid.uuid4().hex,
+            filename=filename,
+            source_path=source_path,
+            size_bytes=size_bytes,
+            cleanup_source=cleanup_source,
+            cleanup_root=cleanup_root,
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+        self._queue.put(job.id)
+        return job
+
+    def list(self) -> list[WebJob]:
+        with self._lock:
+            return list(reversed(self._jobs.values()))
+
+    def get(self, job_id: str) -> WebJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> WebJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status in FINAL_STATES:
+                return job
+            job.cancel_event.set()
+            if job.status == "queued":
+                job.status = "cancelled"
+                job.completed_at = _now()
+                self._remove_source(job)
+            return job
+
+    def delete(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status not in FINAL_STATES:
+                return False
+            self._remove_source(job)
+            del self._jobs[job_id]
+            return True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status not in FINAL_STATES:
+                    job.cancel_event.set()
+        self._queue.put(None)
+        self._worker.join(timeout=10)
+        shutil.rmtree(self.upload_root, ignore_errors=True)
+
+    def _run(self) -> None:
+        while True:
+            job_id = self._queue.get()
+            if job_id is None:
+                return
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job or job.status != "queued":
+                    continue
+                job.status = "analyzing"
+                job.started_at = _now()
+                job.progress = max(job.progress, 1)
+            try:
+                result = self.analyzer.analyze(
+                    job.source_path,
+                    progress=lambda value, current=job: self._set_progress(current, value),
+                    cancel_event=job.cancel_event,
+                )
+                result.metadata.path = job.filename
+                with self._lock:
+                    job.result = result
+                    job.progress = 100
+                    job.status = "completed"
+                    job.completed_at = _now()
+            except AnalysisCancelled:
+                with self._lock:
+                    job.status = "cancelled"
+                    job.completed_at = _now()
+            except Exception as exc:
+                with self._lock:
+                    job.status = "failed"
+                    job.error = str(exc)
+                    job.completed_at = _now()
+            finally:
+                self._remove_source(job)
+
+    def _set_progress(self, job: WebJob, value: float) -> None:
+        with self._lock:
+            if job.status == "analyzing":
+                job.progress = max(job.progress, min(99, round(value * 100)))
+
+    @staticmethod
+    def _remove_source(job: WebJob) -> None:
+        if not job.cleanup_source:
+            return
+        if job.cleanup_root is not None:
+            shutil.rmtree(job.cleanup_root, ignore_errors=True)
+            return
+        try:
+            job.source_path.unlink(missing_ok=True)
+            job.source_path.parent.rmdir()
+        except OSError:
+            pass

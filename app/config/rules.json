@@ -1,0 +1,28 @@
+{
+  "black": {
+    "minimum_duration_seconds": 2.0,
+    "pixel_threshold": 0.10,
+    "warning_total_ratio": 0.05,
+    "failure_total_ratio": 0.15
+  },
+  "silence": {
+    "minimum_duration_seconds": 2.0,
+    "noise_threshold_db": -50.0,
+    "warning_total_ratio": 0.10,
+    "failure_total_ratio": 0.50
+  },
+  "freeze": {
+    "minimum_duration_seconds": 3.0,
+    "noise_threshold_db": -40.0,
+    "warning_total_ratio": 0.10,
+    "failure_total_ratio": 0.40
+  },
+  "quality": {
+    "minimum_width": 360,
+    "minimum_height": 640,
+    "minimum_frame_rate": 23.0,
+    "minimum_video_bitrate_kbps": 400,
+    "warning_score": 80,
+    "failure_score": 60
+  }
+}

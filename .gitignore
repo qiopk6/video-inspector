@@ -1,0 +1,16 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+reports/
+samples/
+artifacts/
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+tools/ffmpeg/*.exe
+tools/ffmpeg/*.dll
+*.log
