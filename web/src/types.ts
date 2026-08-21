@@ -57,6 +57,11 @@ export interface VideoJob {
   started_at: string | null;
   completed_at: string | null;
   error: string | null;
+  group: string | null;
+  batch_id: string;
+  batch_name: string;
+  batch_created_at: string;
+  batch_file_count: number;
   result: AnalysisResult | null;
 }
 

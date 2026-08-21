@@ -10,10 +10,13 @@ from pathlib import Path
 
 
 def _startup_log(message: str) -> None:
-    log_root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "VideoInspector"
-    log_root.mkdir(parents=True, exist_ok=True)
-    with (log_root / "startup.log").open("a", encoding="utf-8") as handle:
-        handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+    try:
+        log_root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "VideoInspector"
+        log_root.mkdir(parents=True, exist_ok=True)
+        with (log_root / "startup.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
 
 
 def _available_port() -> int:
@@ -28,6 +31,7 @@ def main() -> int:
     import uvicorn
 
     _startup_log("importing web application")
+    from app.web.lifecycle import LocalLifecycle
     from app.web.server import create_app
 
     configured_port = os.environ.get("VIDEO_INSPECTOR_PORT")
@@ -39,16 +43,22 @@ def main() -> int:
         raise RuntimeError("VIDEO_INSPECTOR_PORT must be between 1 and 65535")
     url = f"http://127.0.0.1:{port}"
     _startup_log(f"starting server at {url}")
-    if os.environ.get("VIDEO_INSPECTOR_NO_BROWSER") != "1":
-        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
-    uvicorn.run(
-        create_app(),
+    lifecycle = LocalLifecycle()
+    config = uvicorn.Config(
+        create_app(lifecycle=lifecycle),
         host="127.0.0.1",
         port=port,
         log_level="warning",
         access_log=False,
         log_config=None,
     )
+    server = uvicorn.Server(config)
+    lifecycle.attach_server(server)
+    if os.environ.get("VIDEO_INSPECTOR_NO_BROWSER") != "1":
+        browser_timer = threading.Timer(1.2, lambda: webbrowser.open(url))
+        browser_timer.daemon = True
+        browser_timer.start()
+    server.run()
     _startup_log("server stopped")
     return 0
 

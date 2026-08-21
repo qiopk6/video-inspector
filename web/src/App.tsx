@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FilmStrip, Moon, Sun } from "@phosphor-icons/react";
-import { cancelJob, deleteJob, getJobs, uploadHlsDirectory, uploadVideos } from "./api";
+import { FilmStrip, Moon, Power, Sun, X } from "@phosphor-icons/react";
+import { cancelJob, clearFinishedJobs, deleteJob, exitApplication, getJobs, sendHeartbeat, uploadHlsDirectory, uploadVideos } from "./api";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { InspectorPanel } from "./components/InspectorPanel";
 import { JobQueue } from "./components/JobQueue";
@@ -23,6 +23,10 @@ function readUrlState(): { jobId: string | null; view: "overview" | "log"; filte
   return { jobId: params.get("job"), view, filter };
 }
 
+function closeCurrentTab() {
+  window.close();
+}
+
 export default function App() {
   const initial = useMemo(readUrlState, []);
   const [jobs, setJobs] = useState<VideoJob[]>([]);
@@ -37,6 +41,8 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<VideoJob | null>(null);
   const [connected, setConnected] = useState(true);
+  const [quitting, setQuitting] = useState(false);
+  const [shutdownAccepted, setShutdownAccepted] = useState(false);
   const hasActiveJobs = jobs.some((job) => ["queued", "analyzing"].includes(job.status));
 
   const refresh = useCallback(async () => {
@@ -52,10 +58,21 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (quitting) return;
     void refresh();
     const timer = window.setInterval(refresh, hasActiveJobs ? 800 : 2400);
     return () => window.clearInterval(timer);
-  }, [refresh, hasActiveJobs]);
+  }, [refresh, hasActiveJobs, quitting]);
+
+  useEffect(() => {
+    if (quitting) return;
+    const heartbeat = () => {
+      void sendHeartbeat().catch(() => setConnected(false));
+    };
+    heartbeat();
+    const timer = window.setInterval(heartbeat, 3000);
+    return () => window.clearInterval(timer);
+  }, [quitting]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -82,11 +99,11 @@ export default function App() {
 
   useEffect(() => {
     function guard(event: BeforeUnloadEvent) {
-      if (uploading || hlsAdding) event.preventDefault();
+      if (!quitting && (uploading || hlsAdding)) event.preventDefault();
     }
     window.addEventListener("beforeunload", guard);
     return () => window.removeEventListener("beforeunload", guard);
-  }, [uploading, hlsAdding]);
+  }, [uploading, hlsAdding, quitting]);
 
   async function handleFiles(files: File[]) {
     if (!files.length) return;
@@ -112,8 +129,8 @@ export default function App() {
     try {
       const created = await uploadHlsDirectory(files, setHlsProgress);
       await refresh();
-      setSelectedId(created.id);
-      setNotice("已加入 HLS 检测任务");
+      setSelectedId(created[0]?.id || null);
+      setNotice(`已加入 ${created.length} 个 HLS 检测任务`);
     } catch (error) {
       setNotice((error as Error).message);
     } finally {
@@ -144,6 +161,50 @@ export default function App() {
     }
   }
 
+  async function handleClearFinished() {
+    const finishedCount = jobs.filter((job) => ["completed", "failed", "cancelled"].includes(job.status)).length;
+    if (!finishedCount) {
+      setNotice("当前没有可清空的已完成记录");
+      return;
+    }
+    try {
+      const result = await clearFinishedJobs();
+      await refresh();
+      setNotice(`已清空 ${result.deleted} 条记录，正在检测的任务已保留`);
+    } catch (error) {
+      setNotice((error as Error).message);
+    }
+  }
+
+  async function handleExit() {
+    if (quitting) return;
+    if (hasActiveJobs && !window.confirm("当前还有正在检测的任务，退出将取消这些任务并删除临时文件。确定退出吗？")) return;
+    setQuitting(true);
+    try {
+      await exitApplication();
+      document.title = "程序已退出 - Video Inspector";
+      setShutdownAccepted(true);
+      window.setTimeout(closeCurrentTab, 80);
+    } catch (error) {
+      setQuitting(false);
+      setNotice((error as Error).message);
+    }
+  }
+
+  if (shutdownAccepted) {
+    return (
+      <main className="shutdown-screen" role="status" aria-live="polite">
+        <div className="shutdown-mark"><Power size={28} weight="bold" aria-hidden="true" /></div>
+        <h1>程序已退出</h1>
+        <p>浏览器阻止了自动关闭，此标签页可以安全关闭。</p>
+        <button className="button button-secondary" type="button" onClick={closeCurrentTab}>
+          <X size={17} aria-hidden="true" />
+          关闭标签页
+        </button>
+      </main>
+    );
+  }
+
   const selected = jobs.find((job) => job.id === selectedId) || null;
   const selectedStatus = selected ? `${selected.filename}：${selected.status}` : "";
 
@@ -168,6 +229,15 @@ export default function App() {
             onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
           >
             {theme === "dark" ? <Sun size={19} aria-hidden="true" /> : <Moon size={19} aria-hidden="true" />}
+          </button>
+          <button
+            className="button button-danger-quiet exit-button"
+            type="button"
+            disabled={quitting}
+            onClick={() => void handleExit()}
+          >
+            <Power size={17} aria-hidden="true" />
+            <span>{quitting ? "正在退出…" : "退出程序"}</span>
           </button>
         </div>
       </header>
@@ -194,7 +264,7 @@ export default function App() {
         </main>
       ) : (
         <div className="workspace">
-          <JobQueue jobs={jobs} selectedId={selectedId} filter={filter} onFilter={setFilter} onSelect={setSelectedId} />
+          <JobQueue jobs={jobs} selectedId={selectedId} filter={filter} onFilter={setFilter} onSelect={setSelectedId} onClear={handleClearFinished} />
           <InspectorPanel job={selected} view={view} onView={setView} onCancel={handleCancel} onDelete={setDeleteTarget} />
         </div>
       )}

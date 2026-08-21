@@ -1,12 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+import os
 
 from PyInstaller.utils.hooks import collect_submodules
 
 
 project_root = Path(SPEC).resolve().parent
 ffmpeg_dir = project_root / "tools" / "ffmpeg"
-web_dist = project_root / "web" / "dist"
+web_dist = Path(os.environ.get("VIDEO_INSPECTOR_WEB_DIST", project_root / "web" / "dist"))
 
 analysis = Analysis(
     [str(project_root / "app" / "web" / "launcher.py")],

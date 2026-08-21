@@ -16,6 +16,23 @@ export async function getJobs(): Promise<VideoJob[]> {
   return payload.jobs;
 }
 
+export async function sendHeartbeat(): Promise<void> {
+  const response = await fetch("/api/session/heartbeat", {
+    method: "POST",
+    cache: "no-store",
+    keepalive: true,
+  });
+  if (!response.ok) throw new Error(await messageFrom(response));
+}
+
+export async function exitApplication(): Promise<void> {
+  const response = await fetch("/api/session/exit", {
+    method: "POST",
+    keepalive: true,
+  });
+  if (!response.ok) throw new Error(await messageFrom(response));
+}
+
 export function uploadVideos(files: File[], onProgress: (value: number) => void): Promise<VideoJob[]> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -54,7 +71,7 @@ export async function addHlsDirectory(path: string): Promise<VideoJob> {
   return payload.jobs[0];
 }
 
-export function uploadHlsDirectory(files: File[], onProgress: (value: number) => void): Promise<VideoJob> {
+export function uploadHlsDirectory(files: File[], onProgress: (value: number) => void): Promise<VideoJob[]> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     const body = new FormData();
@@ -76,7 +93,7 @@ export function uploadHlsDirectory(files: File[], onProgress: (value: number) =>
     request.addEventListener("load", () => {
       if (request.status >= 200 && request.status < 300) {
         const payload = JSON.parse(request.responseText) as { jobs: VideoJob[] };
-        resolve(payload.jobs[0]);
+        resolve(payload.jobs);
       } else {
         try {
           const payload = JSON.parse(request.responseText) as { detail?: string };
@@ -99,6 +116,12 @@ export async function cancelJob(jobId: string): Promise<void> {
 export async function deleteJob(jobId: string): Promise<void> {
   const response = await fetch(`/api/jobs/${jobId}`, { method: "DELETE" });
   if (!response.ok) throw new Error(await messageFrom(response));
+}
+
+export async function clearFinishedJobs(): Promise<{ deleted: number; remaining: number }> {
+  const response = await fetch("/api/jobs", { method: "DELETE" });
+  if (!response.ok) throw new Error(await messageFrom(response));
+  return (await response.json()) as { deleted: number; remaining: number };
 }
 
 export async function getJobLog(jobId: string): Promise<string> {

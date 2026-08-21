@@ -20,6 +20,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def create_batch_metadata(file_count: int) -> tuple[str, str, str, int]:
+    created_at = _now()
+    display_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    return uuid.uuid4().hex, f"{display_time} · {file_count} 个文件", created_at, file_count
+
+
 @dataclass(slots=True)
 class WebJob:
     id: str
@@ -33,6 +39,11 @@ class WebJob:
     completed_at: str | None = None
     error: str | None = None
     result: AnalysisResult | None = None
+    group: str | None = None
+    batch_id: str = ""
+    batch_name: str = ""
+    batch_created_at: str = ""
+    batch_file_count: int = 1
     cleanup_source: bool = field(default=True, repr=False)
     cleanup_root: Path | None = field(default=None, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -48,6 +59,11 @@ class WebJob:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "group": self.group,
+            "batch_id": self.batch_id,
+            "batch_name": self.batch_name,
+            "batch_created_at": self.batch_created_at,
+            "batch_file_count": self.batch_file_count,
             "result": self.result.to_dict() if self.result else None,
         }
         if include_log:
@@ -74,19 +90,51 @@ class JobManager:
         size_bytes: int,
         cleanup_source: bool = True,
         cleanup_root: Path | None = None,
+        group: str | None = None,
+        batch_id: str | None = None,
+        batch_name: str | None = None,
+        batch_created_at: str | None = None,
+        batch_file_count: int | None = None,
     ) -> WebJob:
-        job = WebJob(
-            id=uuid.uuid4().hex,
-            filename=filename,
-            source_path=source_path,
-            size_bytes=size_bytes,
-            cleanup_source=cleanup_source,
-            cleanup_root=cleanup_root,
-        )
+        return self.add_many([
+            (filename, source_path, size_bytes, cleanup_source, cleanup_root, group),
+        ], batch_id, batch_name, batch_created_at, batch_file_count)[0]
+
+    def add_many(
+        self,
+        entries: list[tuple[str, Path, int, bool, Path | None, str | None]],
+        batch_id: str | None = None,
+        batch_name: str | None = None,
+        batch_created_at: str | None = None,
+        batch_file_count: int | None = None,
+    ) -> list[WebJob]:
+        if not entries:
+            return []
+        if batch_id is None or batch_name is None or batch_created_at is None:
+            batch_id, batch_name, batch_created_at, batch_file_count = create_batch_metadata(len(entries))
+        batch_file_count = batch_file_count if batch_file_count is not None else len(entries)
+        jobs = [
+            WebJob(
+                id=uuid.uuid4().hex,
+                filename=filename,
+                source_path=source_path,
+                size_bytes=size_bytes,
+                cleanup_source=cleanup_source,
+                cleanup_root=cleanup_root,
+                group=group,
+                batch_id=batch_id,
+                batch_name=batch_name,
+                batch_created_at=batch_created_at,
+                batch_file_count=batch_file_count,
+            )
+            for filename, source_path, size_bytes, cleanup_source, cleanup_root, group in entries
+        ]
         with self._lock:
-            self._jobs[job.id] = job
-        self._queue.put(job.id)
-        return job
+            for job in jobs:
+                self._jobs[job.id] = job
+        for job in jobs:
+            self._queue.put(job.id)
+        return jobs
 
     def list(self) -> list[WebJob]:
         with self._lock:
@@ -108,6 +156,15 @@ class JobManager:
                 self._remove_source(job)
             return job
 
+    def cancel_all(self) -> None:
+        with self._lock:
+            job_ids = [
+                job.id for job in self._jobs.values()
+                if job.status not in FINAL_STATES
+            ]
+        for job_id in job_ids:
+            self.cancel(job_id)
+
     def delete(self, job_id: str) -> bool:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -117,14 +174,16 @@ class JobManager:
             del self._jobs[job_id]
             return True
 
+    def clear_finished(self) -> int:
+        with self._lock:
+            job_ids = [job.id for job in self._jobs.values() if job.status in FINAL_STATES]
+        return sum(1 for job_id in job_ids if self.delete(job_id))
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        with self._lock:
-            for job in self._jobs.values():
-                if job.status not in FINAL_STATES:
-                    job.cancel_event.set()
+        self.cancel_all()
         self._queue.put(None)
         self._worker.join(timeout=10)
         shutil.rmtree(self.upload_root, ignore_errors=True)
@@ -170,12 +229,18 @@ class JobManager:
             if job.status == "analyzing":
                 job.progress = max(job.progress, min(99, round(value * 100)))
 
-    @staticmethod
-    def _remove_source(job: WebJob) -> None:
+    def _remove_source(self, job: WebJob) -> None:
         if not job.cleanup_source:
             return
         if job.cleanup_root is not None:
-            shutil.rmtree(job.cleanup_root, ignore_errors=True)
+            with self._lock:
+                group_jobs = [
+                    item for item in self._jobs.values()
+                    if item.cleanup_root == job.cleanup_root
+                ]
+                all_finished = group_jobs and all(item.status in FINAL_STATES for item in group_jobs)
+            if all_finished:
+                shutil.rmtree(job.cleanup_root, ignore_errors=True)
             return
         try:
             job.source_path.unlink(missing_ok=True)

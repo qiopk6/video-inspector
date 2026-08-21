@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -21,7 +22,8 @@ from app.core.analyzer import VideoAnalyzer
 from app.core.config import load_rules
 from app.core.ffmpeg_locator import FFmpegTools, locate_ffmpeg
 from app.core.report import export_html
-from app.web.jobs import FINAL_STATES, JobManager
+from app.web.jobs import FINAL_STATES, JobManager, create_batch_metadata
+from app.web.lifecycle import LocalLifecycle
 
 
 VIDEO_EXTENSIONS = {
@@ -43,6 +45,13 @@ class LocalHlsSource:
     size_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class HlsPlaylistTask:
+    source: LocalHlsSource
+    filename: str
+    group: str | None
+
+
 def _is_within(path: Path, directory: Path) -> bool:
     try:
         path.relative_to(directory)
@@ -51,33 +60,7 @@ def _is_within(path: Path, directory: Path) -> bool:
     return True
 
 
-def _resolve_local_hls(path_text: str) -> LocalHlsSource:
-    if not path_text.strip():
-        raise HTTPException(status_code=400, detail="请输入本地 HLS 目录或 index.m3u8 路径")
-
-    candidate = Path(path_text.strip()).expanduser()
-    if not candidate.is_absolute():
-        raise HTTPException(status_code=400, detail="HLS 路径必须是本机绝对路径")
-    try:
-        candidate = candidate.resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="找不到指定的 HLS 路径") from exc
-
-    if candidate.is_dir():
-        playlist_candidates = sorted(
-            item for item in candidate.iterdir()
-            if item.is_file() and item.suffix.lower() in HLS_EXTENSIONS
-        )
-        if not playlist_candidates:
-            raise HTTPException(status_code=400, detail="目录中没有 .m3u8 或 .m3u 播放列表")
-        if len(playlist_candidates) > 1:
-            raise HTTPException(status_code=409, detail="目录中存在多个播放列表，请直接指定要检测的 m3u8 文件")
-        playlist = playlist_candidates[0]
-    elif candidate.is_file() and candidate.suffix.lower() in HLS_EXTENSIONS:
-        playlist = candidate
-    else:
-        raise HTTPException(status_code=400, detail="路径必须是 HLS 目录或 .m3u8 文件")
-
+def _resolve_hls_playlist(playlist: Path) -> LocalHlsSource:
     try:
         content = playlist.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -115,6 +98,62 @@ def _resolve_local_hls(path_text: str) -> LocalHlsSource:
     return LocalHlsSource(playlist=playlist, segments=unique_segments, size_bytes=total_size)
 
 
+def _resolve_local_hls(path_text: str) -> LocalHlsSource:
+    if not path_text.strip():
+        raise HTTPException(status_code=400, detail="请输入本地 HLS 目录或 index.m3u8 路径")
+
+    candidate = Path(path_text.strip()).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=400, detail="HLS 路径必须是本机绝对路径")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="找不到指定的 HLS 路径") from exc
+
+    if candidate.is_file() and candidate.suffix.lower() in HLS_EXTENSIONS:
+        return _resolve_hls_playlist(candidate)
+    if not candidate.is_dir():
+        raise HTTPException(status_code=400, detail="路径必须是 HLS 目录或 .m3u8 文件")
+
+    playlists = [
+        item for item in candidate.rglob("*")
+        if item.is_file() and item.suffix.lower() in HLS_EXTENSIONS
+        and "#EXT-X-STREAM-INF" not in item.read_text(encoding="utf-8-sig")
+    ]
+    if len(playlists) != 1:
+        raise HTTPException(status_code=409, detail="目录中发现多个媒体播放列表，请使用 HLS 文件夹上传或直接指定一个 m3u8 文件")
+    return _resolve_hls_playlist(playlists[0])
+
+
+def _discover_hls_tasks(root: Path) -> list[HlsPlaylistTask]:
+    candidates = sorted(
+        item for item in root.rglob("*")
+        if item.is_file() and item.suffix.lower() in HLS_EXTENSIONS
+    )
+    tasks: list[HlsPlaylistTask] = []
+    for playlist in candidates:
+        content = playlist.read_text(encoding="utf-8-sig")
+        if "#EXT-X-STREAM-INF" in content:
+            continue
+        source = _resolve_hls_playlist(playlist)
+        relative = playlist.relative_to(root)
+        parts = relative.parts
+        resolution = playlist.parent.name
+        group = resolution.upper() if resolution.lower().endswith("p") else None
+        filename = "/".join(parts)
+        tasks.append(HlsPlaylistTask(source=source, filename=filename, group=group))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="HLS 文件夹中没有可检测的媒体播放列表")
+
+    def sort_key(task: HlsPlaylistTask) -> tuple[int, str, str]:
+        resolution = task.group or ""
+        digits = "".join(character for character in resolution if character.isdigit())
+        return (int(digits) if digits else 99999, task.filename.lower(), task.filename)
+
+    return sorted(tasks, key=sort_key)
+
+
 def _static_root() -> Path:
     bundle_root = getattr(sys, "_MEIPASS", None)
     if bundle_root:
@@ -146,6 +185,7 @@ def create_app(
     tools: FFmpegTools | None = None,
     upload_root: Path | None = None,
     static_root: Path | None = None,
+    lifecycle: LocalLifecycle | None = None,
 ) -> FastAPI:
     resolved_tools = tools or locate_ffmpeg()
     root = upload_root or Path(tempfile.gettempdir()) / "VideoInspectorWeb" / uuid.uuid4().hex
@@ -153,15 +193,37 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        manager.close()
+        if lifecycle is not None:
+            lifecycle.start(manager)
+        try:
+            yield
+        finally:
+            if lifecycle is not None:
+                lifecycle.stop()
+            manager.close()
 
     app = FastAPI(title="Video Inspector", version="0.2.0", lifespan=lifespan)
     app.state.jobs = manager
+    app.state.lifecycle = lifecycle
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "version": "0.2.0"}
+
+    @app.post("/api/session/heartbeat")
+    def session_heartbeat() -> dict[str, str]:
+        if lifecycle is not None:
+            lifecycle.record_heartbeat()
+        return {"status": "ok"}
+
+    @app.post("/api/session/exit", status_code=202)
+    def exit_application() -> dict[str, str]:
+        if lifecycle is None:
+            raise HTTPException(status_code=503, detail="本地程序未启用生命周期控制")
+        timer = threading.Timer(0.1, lifecycle.request_shutdown, args=("user requested exit",))
+        timer.daemon = True
+        timer.start()
+        return {"status": "shutting_down"}
 
     @app.get("/api/jobs")
     def list_jobs() -> dict[str, object]:
@@ -190,6 +252,7 @@ def create_app(
             if Path(upload.filename or "").suffix.lower() not in VIDEO_EXTENSIONS:
                 raise HTTPException(status_code=415, detail=f"不支持的文件类型：{upload.filename}")
 
+        batch_id, batch_name, batch_created_at, batch_file_count = create_batch_metadata(len(files))
         created = []
         for upload in files:
             filename = _safe_filename(upload.filename or "video")
@@ -208,7 +271,15 @@ def create_app(
                 raise
             finally:
                 await upload.close()
-            created.append(manager.add(filename, destination, size).to_public())
+            created.append(manager.add(
+                filename,
+                destination,
+                size,
+                batch_id=batch_id,
+                batch_name=batch_name,
+                batch_created_at=batch_created_at,
+                batch_file_count=batch_file_count,
+            ).to_public())
         return {"jobs": created}
 
     @app.post("/api/hls/upload", status_code=201)
@@ -245,16 +316,14 @@ def create_app(
                 finally:
                     await upload.close()
 
-            source = _resolve_local_hls(str(directory))
-            folder_label = _safe_filename(directory_name) or "HLS"
-            display_name = f"{folder_label}/{source.playlist.name}"
-            job = manager.add(
-                display_name,
-                source.playlist,
-                source.size_bytes,
-                cleanup_root=directory,
-            )
-            return {"jobs": [job.to_public()]}
+            tasks = _discover_hls_tasks(directory)
+            batch_id, batch_name, batch_created_at, batch_file_count = create_batch_metadata(len(tasks))
+            jobs = manager.add_many([
+                (task.filename, task.source.playlist, task.source.size_bytes, True, directory, task.group)
+                for task in tasks
+            ], batch_id, batch_name, batch_created_at, batch_file_count)
+            created = [job.to_public() for job in jobs]
+            return {"jobs": created}
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
@@ -278,6 +347,11 @@ def create_app(
         if not job:
             raise HTTPException(status_code=404, detail="任务不存在")
         return job.to_public()
+
+    @app.delete("/api/jobs")
+    def clear_finished_jobs() -> dict[str, int]:
+        deleted = manager.clear_finished()
+        return {"deleted": deleted, "remaining": len(manager.list())}
 
     @app.delete("/api/jobs/{job_id}", status_code=204)
     def delete_job(job_id: str) -> None:
