@@ -1,13 +1,13 @@
 # Video Inspector
 
-Windows 本地视频质检工具。应用通过 FFprobe 读取媒体信息，通过 FFmpeg 检测解码错误、黑屏、静音和冻结画面，并生成 JSON/HTML 报告。项目同时提供浏览器界面和 PySide6 桌面界面。
+Windows 本地 Web 视频质检工具。应用通过 FFprobe 读取媒体信息，通过 FFmpeg 检测解码错误、黑屏、静音和冻结画面，并生成 JSON/HTML 报告。
 
-## Web 版运行
+## 运行
 
 Web 版仅监听 `127.0.0.1`，上传的视频不会离开当前电脑。
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-web.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 cd web
 pnpm install
 pnpm run build
@@ -15,7 +15,7 @@ cd ..
 .\.venv\Scripts\python.exe -m app.web.launcher
 ```
 
-打包 Web 版：
+打包 Windows EXE：
 
 ```powershell
 .\scripts\build_web.ps1
@@ -23,7 +23,7 @@ cd ..
 
 产物位于 `dist/VideoInspectorWeb/VideoInspectorWeb.exe`。
 
-Web 版支持本地 VOD HLS 检测。在页面中选择“添加 M3U8”，通过浏览器调用的
+程序支持本地 VOD HLS 检测。在页面中选择“添加 M3U8”，通过浏览器调用的
 Windows 文件夹选择器选中包含播放列表和分片的整个目录，例如：
 
 ```text
@@ -45,29 +45,11 @@ E:\新建文件夹\dist\data\outputs\001\HLS
 60 秒没有浏览器连接时同样会自动退出。普通浏览器可能禁止网页关闭非脚本创建的
 标签页，此时页面会显示关闭提示和手动关闭按钮。
 
-## 桌面版运行
-
-1. 准备 Windows 版 `ffmpeg.exe` 和 `ffprobe.exe`，放入 `tools/ffmpeg/`。
-2. 创建虚拟环境并安装依赖：
-
-   ```powershell
-   py -3.12 -m venv .venv
-   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-   ```
-
-3. 启动：
-
-   ```powershell
-   .\.venv\Scripts\python.exe -m app.main
-   ```
-
-也可以设置 `VIDEO_INSPECTOR_FFMPEG_DIR` 指向包含 FFmpeg 二进制文件的目录。
-
 ## 测试与打包
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\scripts\build.ps1
+.\scripts\build_web.ps1
 ```
 
-打包结果位于 `dist/VideoInspector/`。
+打包结果位于 `dist/VideoInspectorWeb/`。
